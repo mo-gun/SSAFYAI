@@ -1,0 +1,771 @@
+# improved baseline v1
+
+이 노트북은 업로드한 `baseline_colab.ipynb` 형식을 유지하면서, 현재 데이터 구조에 맞게 다음 사항을 반영한 **개선 버전**입니다.
+
+- `train.csv`의 정답 알파벳을 **실제 보기 텍스트**로 매핑하여 학습
+- `dev.csv`는 `answer1~answer5`의 **최빈값**으로 정답 생성
+- `human_check.csv`는 동일 ID가 있을 경우 **dev보다 우선 적용**
+- 최종 제출은 `sample_submission.csv` 형식에 맞춰 **a/b/c/d 소문자 1글자**만 출력
+- Colab Pro+ / A100 기준으로 **Qwen2.5-VL-3B-Instruct + LoRA** 설정
+- 빠른 점검을 위한 **500개 샘플 학습 모드** 주석 포함
+- 경로 오류를 줄이기 위해 `train / trian / dev / test` 폴더를 모두 탐색하는 **안전한 path resolver** 포함
+
+> 핵심 전략:  
+> 학습은 **정답 텍스트**로 시키고, 추론 시에는 모델이 생성한 텍스트를 보기와 매칭하여 **최종 알파벳**으로 변환합니다.
+# 1. 환경 준비
+
+아래 셀을 실행한 뒤 **런타임을 한 번 다시 시작**하는 것을 권장합니다.
+!pip -q install -U git+https://github.com/huggingface/transformers accelerate
+!pip -q install -U peft bitsandbytes datasets pillow pandas scikit-learn tqdm
+import torch, transformers, peft, pandas as pd, numpy as np
+print("torch:", torch.__version__)
+print("transformers:", transformers.__version__)
+print("peft:", peft.__version__)
+print("cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("gpu:", torch.cuda.get_device_name(0))
+# 2. 구글 드라이브 마운트 및 기본 경로 설정
+
+사용자가 설명한 구조 기준:
+
+- `/content/drive/MyDrive/ColabNotebooks/content/`
+- 그 안에 `train.csv`, `dev.csv`, `human_check.csv`, `test.csv`, `sample_submission.csv`
+- 이미지 폴더: `train`, `trian`, `dev`, `test` 중 실제 존재하는 폴더 사용
+from google.colab import drive
+drive.mount('/content/drive')
+import os
+from pathlib import Path
+
+# 기본 경로
+BASE_DIR = Path("/content/drive/MyDrive/ColabNotebooks/content")
+
+# CSV 파일 경로
+TRAIN_CSV = BASE_DIR / "train.csv"
+DEV_CSV = BASE_DIR / "dev.csv"
+HUMAN_CHECK_CSV = BASE_DIR / "human_check.csv"
+TEST_CSV = BASE_DIR / "test.csv"
+SAMPLE_SUB_CSV = BASE_DIR / "sample_submission.csv"
+
+# 저장 경로
+OUTPUT_DIR = BASE_DIR / "outputs_vqa_qwen25vl"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("BASE_DIR:", BASE_DIR)
+print("OUTPUT_DIR:", OUTPUT_DIR)
+# 3. 라이브러리 및 공통 설정
+import re
+import gc
+import math
+import json
+import random
+from collections import Counter
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+
+from PIL import Image, ImageFile
+Image.MAX_IMAGE_PIXELS = None
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
+
+from transformers import (
+    Qwen2_5_VLForConditionalGeneration,
+    AutoProcessor,
+    BitsAndBytesConfig,
+    get_linear_schedule_with_warmup,
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+def seed_everything(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+seed_everything(42)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("device:", device)
+# 4. 데이터 로드 및 정답 텍스트 생성
+
+학습용 최종 데이터 구성 규칙:
+
+1. `train.csv`: `answer` 알파벳을 실제 보기 텍스트로 변환  
+2. `dev.csv`: `answer1~answer5` 최빈값으로 정답 생성  
+3. `human_check.csv`: `answer`를 실제 정답으로 사용  
+4. `human_check.csv`에 포함된 ID는 dev 원본보다 **우선 반영**
+train_df = pd.read_csv(TRAIN_CSV)
+dev_df = pd.read_csv(DEV_CSV)
+human_df = pd.read_csv(HUMAN_CHECK_CSV)
+test_df = pd.read_csv(TEST_CSV)
+sample_sub = pd.read_csv(SAMPLE_SUB_CSV)
+
+print("train:", train_df.shape)
+print("dev:", dev_df.shape)
+print("human_check:", human_df.shape)
+print("test:", test_df.shape)
+print("sample_submission:", sample_sub.shape)
+
+display(train_df.head(2))
+display(dev_df.head(2))
+display(human_df.head(2))
+display(test_df.head(2))
+OPTION_LETTERS = ["a", "b", "c", "d"]
+
+def normalize_text(x: str) -> str:
+    x = "" if pd.isna(x) else str(x)
+    x = x.strip().lower()
+    x = re.sub(r"\s+", "", x)
+    x = re.sub(r"[\"'“”‘’.,!?~`·:;()\[\]{}<>|\\/_+-]", "", x)
+    return x
+
+def answer_letter_to_text(row, answer_col="answer"):
+    letter = str(row[answer_col]).strip().lower()
+    if letter not in OPTION_LETTERS:
+        return None
+    return str(row[letter]).strip()
+
+def majority_vote_answer(row):
+    votes = []
+    for c in ["answer1", "answer2", "answer3", "answer4", "answer5"]:
+        v = str(row[c]).strip().lower()
+        if v in OPTION_LETTERS:
+            votes.append(v)
+    if not votes:
+        return None
+
+    counts = Counter(votes)
+    # 동률일 경우 answer1~answer5에 먼저 등장한 알파벳 우선
+    best_count = max(counts.values())
+    tied = [k for k, v in counts.items() if v == best_count]
+    if len(tied) == 1:
+        return tied[0]
+    for v in votes:
+        if v in tied:
+            return v
+    return tied[0]
+
+# train
+train_proc = train_df.copy()
+train_proc["answer_letter"] = train_proc["answer"].astype(str).str.lower().str.strip()
+train_proc["answer_text"] = train_proc.apply(answer_letter_to_text, axis=1)
+train_proc["source"] = "train"
+
+# dev (최빈값)
+dev_proc = dev_df.copy()
+dev_proc["answer_letter"] = dev_proc.apply(majority_vote_answer, axis=1)
+dev_proc["answer_text"] = dev_proc.apply(
+    lambda r: str(r[r["answer_letter"]]).strip() if r["answer_letter"] in OPTION_LETTERS else None,
+    axis=1
+)
+dev_proc["source"] = "dev_majority"
+
+# human_check
+human_proc = human_df.copy()
+human_proc["answer_letter"] = human_proc["answer"].astype(str).str.lower().str.strip()
+human_proc["answer_text"] = human_proc.apply(answer_letter_to_text, axis=1)
+human_proc["source"] = "human_check"
+
+# human_check id는 dev보다 우선
+human_ids = set(human_proc["id"].astype(str))
+dev_proc = dev_proc[~dev_proc["id"].astype(str).isin(human_ids)].reset_index(drop=True)
+
+final_train_df = pd.concat([
+    train_proc[["id", "path", "question", "a", "b", "c", "d", "answer_letter", "answer_text", "source"]],
+    dev_proc[["id", "path", "question", "a", "b", "c", "d", "answer_letter", "answer_text", "source"]],
+    human_proc[["id", "path", "question", "a", "b", "c", "d", "answer_letter", "answer_text", "source"]],
+], axis=0, ignore_index=True)
+
+# 결측 제거
+final_train_df = final_train_df.dropna(subset=["answer_letter", "answer_text"]).reset_index(drop=True)
+
+print("final_train_df:", final_train_df.shape)
+print(final_train_df["source"].value_counts())
+display(final_train_df.head(3))
+# 5. 경로 보정 함수
+
+CSV의 `path`가 실제 드라이브 구조와 다르거나, 폴더명이 `train` 대신 `trian`인 경우를 대비합니다.
+def infer_split_from_id(file_id: str) -> Optional[str]:
+    file_id = str(file_id).lower()
+    if file_id.startswith("train_"):
+        return "train"
+    if file_id.startswith("dev_"):
+        return "dev"
+    if file_id.startswith("test_"):
+        return "test"
+    return None
+
+def resolve_image_path(row, base_dir: Path = BASE_DIR) -> str:
+    rel_path = str(row["path"]).strip().replace("\\", "/")
+    file_id = str(row["id"]).strip()
+
+    candidates = []
+
+    # 1) csv path 그대로
+    candidates.append(base_dir / rel_path)
+
+    # 2) train -> trian 오타 보정
+    if rel_path.startswith("train/"):
+        candidates.append(base_dir / rel_path.replace("train/", "trian/", 1))
+    if rel_path.startswith("trian/"):
+        candidates.append(base_dir / rel_path.replace("trian/", "train/", 1))
+
+    # 3) id 기반 추정
+    split_name = infer_split_from_id(file_id)
+    if split_name is not None:
+        candidates.append(base_dir / split_name / file_id)
+        if split_name == "train":
+            candidates.append(base_dir / "trian" / file_id)
+
+    # 4) 폴더 전체 탐색 fallback
+    for folder in ["train", "trian", "dev", "test"]:
+        candidates.append(base_dir / folder / file_id)
+
+    seen = set()
+    deduped = []
+    for p in candidates:
+        p = Path(p)
+        if str(p) not in seen:
+            deduped.append(p)
+            seen.add(str(p))
+
+    for p in deduped:
+        if p.exists():
+            return str(p)
+
+    raise FileNotFoundError(
+        f"이미지를 찾지 못했습니다. id={file_id}, csv_path={rel_path}, tried={[str(x) for x in deduped[:8]]}"
+    )
+
+# 실제 경로 확인 샘플
+for idx in [0, 1, 2]:
+    try:
+        print(final_train_df.iloc[idx]["id"], "->", resolve_image_path(final_train_df.iloc[idx]))
+    except Exception as e:
+        print("PATH CHECK ERROR:", e)
+# 6. 학습/검증 분리 및 빠른 점검 옵션
+
+아래 `QUICK_MODE`를 `True`로 바꾸면 **500개만 빠르게 학습**하도록 설정할 수 있습니다.  
+사용자가 요청한 것처럼 **주석 해제만 하면 되도록** 작성했습니다.
+# =========================
+# 실행 설정
+# =========================
+MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+IMAGE_SIZE = 448
+EPOCHS = 1
+TRAIN_BATCH_SIZE = 1
+EVAL_BATCH_SIZE = 1
+GRAD_ACCUM_STEPS = 8
+LR = 2e-5
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.03
+MAX_NEW_TOKENS = 8
+SEED = 42
+
+# 빠른 테스트용 설정
+QUICK_MODE = False
+
+# QUICK_MODE = True   # <- 빠르게 500개만 점검하려면 이 줄 주석 해제
+# QUICK_TRAIN_SAMPLES = 500
+# QUICK_VALID_SAMPLES = 100
+
+seed_everything(SEED)
+
+train_part, valid_part = train_test_split(
+    final_train_df,
+    test_size=0.05,
+    random_state=SEED,
+    shuffle=True
+)
+
+train_part = train_part.reset_index(drop=True)
+valid_part = valid_part.reset_index(drop=True)
+
+if QUICK_MODE:
+    QUICK_TRAIN_SAMPLES = 500
+    QUICK_VALID_SAMPLES = 100
+    train_part = train_part.iloc[:QUICK_TRAIN_SAMPLES].reset_index(drop=True)
+    valid_part = valid_part.iloc[:QUICK_VALID_SAMPLES].reset_index(drop=True)
+
+print("train_part:", train_part.shape)
+print("valid_part:", valid_part.shape)
+# 7. 프롬프트 템플릿
+
+baseline의 멀티모달 chat 형식은 유지하되, 학습 목표를 **정답 텍스트 그대로 출력**하도록 바꿉니다.
+
+즉, 예를 들어 정답이 `b = 금속`이면 학습 target은 `금속`입니다.  
+추론 시에는 생성된 텍스트를 보기와 매칭해서 최종적으로 `b`를 제출합니다.
+SYSTEM_INSTRUCT = (
+    "당신은 재활용 이미지 질의응답 모델입니다. "
+    "이미지와 질문, 보기(a,b,c,d)를 함께 보고 정답 보기의 내용을 정확히 판단하세요. "
+    "반드시 보기 중 하나의 '내용 텍스트'만 그대로 출력하고, 설명은 하지 마세요."
+)
+
+def build_user_prompt(question: str, a: str, b: str, c: str, d: str) -> str:
+    return (
+        f"[질문]\n{question}\n\n"
+        f"[보기]\n"
+        f"(a) {a}\n"
+        f"(b) {b}\n"
+        f"(c) {c}\n"
+        f"(d) {d}\n\n"
+        "정답인 보기의 내용을 그대로 한 번만 출력하세요. "
+        "알파벳만 출력하지 말고, 보기 내용 텍스트 자체를 출력하세요."
+    )
+# 8. Processor 및 모델 로드
+
+A100 환경에서는 3B 모델 + 4bit + LoRA 조합이 안정적이고 속도/메모리 균형이 좋습니다.
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
+
+processor = AutoProcessor.from_pretrained(
+    MODEL_ID,
+    min_pixels=IMAGE_SIZE * IMAGE_SIZE,
+    max_pixels=IMAGE_SIZE * IMAGE_SIZE,
+    trust_remote_code=True
+)
+
+base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    MODEL_ID,
+    quantization_config=bnb_config,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True
+)
+
+base_model = prepare_model_for_kbit_training(base_model)
+base_model.gradient_checkpointing_enable()
+
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ]
+)
+
+model = get_peft_model(base_model, lora_config)
+model.print_trainable_parameters()
+# 9. Dataset / Collator
+
+핵심 포인트:
+
+- 입력: 이미지 + 질문 + 보기
+- 정답: 알파벳이 아닌 **정답 텍스트**
+- loss 계산 시 prompt 구간은 마스킹하고, **assistant 정답 텍스트 구간만 학습**
+class VQATextDataset(Dataset):
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.reset_index(drop=True)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        img_path = resolve_image_path(row)
+        image = Image.open(img_path).convert("RGB")
+
+        user_prompt = build_user_prompt(
+            str(row["question"]),
+            str(row["a"]),
+            str(row["b"]),
+            str(row["c"]),
+            str(row["d"])
+        )
+
+        answer_text = str(row["answer_text"]).strip()
+
+        prompt_messages = [
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_INSTRUCT}]},
+            {"role": "user", "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": user_prompt}
+            ]}
+        ]
+
+        full_messages = prompt_messages + [
+            {"role": "assistant", "content": [{"type": "text", "text": answer_text}]}
+        ]
+
+        prompt_text = processor.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True
+        )
+        full_text = processor.apply_chat_template(
+            full_messages, tokenize=False, add_generation_prompt=False
+        )
+
+        return {
+            "id": row["id"],
+            "image": image,
+            "prompt_text": prompt_text,
+            "full_text": full_text,
+            "answer_text": answer_text,
+            "options": {
+                "a": str(row["a"]),
+                "b": str(row["b"]),
+                "c": str(row["c"]),
+                "d": str(row["d"]),
+            }
+        }
+
+@dataclass
+class DataCollatorForVQAText:
+    processor: Any
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        assert len(features) == 1, "이 노트북은 안정성을 위해 batch_size=1 기준으로 작성되었습니다."
+
+        feat = features[0]
+        image = feat["image"]
+
+        prompt_inputs = self.processor(
+            text=[feat["prompt_text"]],
+            images=[image],
+            return_tensors="pt"
+        )
+
+        full_inputs = self.processor(
+            text=[feat["full_text"]],
+            images=[image],
+            return_tensors="pt"
+        )
+
+        input_ids = full_inputs["input_ids"]
+        attention_mask = full_inputs["attention_mask"]
+        pixel_values = full_inputs["pixel_values"]
+
+        labels = input_ids.clone()
+        prompt_len = prompt_inputs["input_ids"].shape[1]
+        labels[:, :prompt_len] = -100
+        labels[attention_mask == 0] = -100
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "labels": labels
+        }
+# 10. DataLoader 준비
+train_ds = VQATextDataset(train_part)
+valid_ds = VQATextDataset(valid_part)
+
+collator = DataCollatorForVQAText(processor)
+
+train_loader = DataLoader(
+    train_ds,
+    batch_size=TRAIN_BATCH_SIZE,
+    shuffle=True,
+    num_workers=0,
+    collate_fn=collator
+)
+
+valid_loader = DataLoader(
+    valid_ds,
+    batch_size=EVAL_BATCH_SIZE,
+    shuffle=False,
+    num_workers=0,
+    collate_fn=collator
+)
+
+print("train batches:", len(train_loader))
+print("valid batches:", len(valid_loader))
+# 11. 학습 루프
+
+NaN 방지를 위해 다음을 적용했습니다.
+
+- 낮은 learning rate
+- bf16 사용
+- gradient clipping
+- prompt 영역 마스킹
+- optimizer step 전 NaN/Inf 체크
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LR,
+    weight_decay=WEIGHT_DECAY
+)
+
+num_update_steps_per_epoch = math.ceil(len(train_loader) / GRAD_ACCUM_STEPS)
+num_training_steps = EPOCHS * max(1, num_update_steps_per_epoch)
+num_warmup_steps = int(num_training_steps * WARMUP_RATIO)
+
+scheduler = get_linear_schedule_with_warmup(
+    optimizer=optimizer,
+    num_warmup_steps=num_warmup_steps,
+    num_training_steps=num_training_steps
+)
+
+def move_batch_to_device(batch):
+    return {k: v.to(device) for k, v in batch.items()}
+
+best_val_loss = float("inf")
+train_history = []
+
+model.train()
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss = 0.0
+    optimizer.zero_grad(set_to_none=True)
+
+    pbar = tqdm(train_loader, total=len(train_loader), desc=f"Epoch {epoch+1}/{EPOCHS} [train]")
+
+    for step, batch in enumerate(pbar, start=1):
+        batch = move_batch_to_device(batch)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+            outputs = model(**batch)
+            loss = outputs.loss / GRAD_ACCUM_STEPS
+
+        if not torch.isfinite(loss):
+            print(f"[WARNING] non-finite loss detected at step={step}: {loss}")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        loss.backward()
+        running_loss += loss.item()
+
+        if step % GRAD_ACCUM_STEPS == 0 or step == len(train_loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        avg_loss = running_loss / step
+        pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
+
+    # validation
+    model.eval()
+    val_losses = []
+
+    with torch.no_grad():
+        vbar = tqdm(valid_loader, total=len(valid_loader), desc=f"Epoch {epoch+1}/{EPOCHS} [valid]")
+        for batch in vbar:
+            batch = move_batch_to_device(batch)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                outputs = model(**batch)
+                val_loss = outputs.loss
+
+            if torch.isfinite(val_loss):
+                val_losses.append(val_loss.item())
+
+            vbar.set_postfix({"val_loss": f"{np.mean(val_losses):.4f}" if len(val_losses) else "nan"})
+
+    mean_train_loss = running_loss / max(1, len(train_loader))
+    mean_val_loss = float(np.mean(val_losses)) if len(val_losses) else float("inf")
+
+    train_history.append({
+        "epoch": epoch + 1,
+        "train_loss": mean_train_loss,
+        "val_loss": mean_val_loss
+    })
+
+    print(f"Epoch {epoch+1} | train_loss={mean_train_loss:.4f} | val_loss={mean_val_loss:.4f}")
+
+    if mean_val_loss < best_val_loss:
+        best_val_loss = mean_val_loss
+        model.save_pretrained(OUTPUT_DIR / "best_lora_adapter")
+        processor.save_pretrained(OUTPUT_DIR / "best_lora_adapter")
+        print("Best adapter saved.")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+history_df = pd.DataFrame(train_history)
+display(history_df)
+# 12. 베스트 어댑터 재로딩
+# 이미 메모리에 학습된 model이 있으므로 그대로 사용 가능
+# 아래 셀은 저장된 adapter 기준 재사용용 경로 확인 셀입니다.
+print("Best adapter path:", OUTPUT_DIR / "best_lora_adapter")
+# 13. 추론용 후처리 함수
+
+추론 절차:
+
+1. 모델이 정답 **텍스트**를 생성  
+2. 생성 텍스트를 보기(a,b,c,d)와 정규화 비교  
+3. 매칭 실패 시, 각 보기 텍스트의 **conditional loss**를 계산하여 가장 낮은 보기 선택  
+4. 최종적으로 `a/b/c/d` 한 글자만 제출
+def map_generated_text_to_letter(pred_text: str, options: Dict[str, str]) -> Optional[str]:
+    pred_norm = normalize_text(pred_text)
+
+    if pred_norm == "":
+        return None
+
+    norm_options = {k: normalize_text(v) for k, v in options.items()}
+
+    # 1) 완전일치
+    for k, v in norm_options.items():
+        if pred_norm == v:
+            return k
+
+    # 2) 포함관계
+    for k, v in norm_options.items():
+        if pred_norm in v or v in pred_norm:
+            return k
+
+    # 3) 숫자형/단문 대응 보조
+    for k, v in norm_options.items():
+        if len(pred_norm) <= 4 and pred_norm == v[:len(pred_norm)]:
+            return k
+
+    return None
+
+def generate_answer_text(row) -> str:
+    img_path = resolve_image_path(row)
+    image = Image.open(img_path).convert("RGB")
+
+    user_prompt = build_user_prompt(
+        str(row["question"]),
+        str(row["a"]),
+        str(row["b"]),
+        str(row["c"]),
+        str(row["d"])
+    )
+
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_INSTRUCT}]},
+        {"role": "user", "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": user_prompt}
+        ]}
+    ]
+
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[image], return_tensors="pt").to(device)
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            use_cache=True,
+            eos_token_id=processor.tokenizer.eos_token_id
+        )
+
+    generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+    pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    return pred_text
+
+def score_candidate_answers(row, candidates: Dict[str, str]) -> str:
+    img_path = resolve_image_path(row)
+    image = Image.open(img_path).convert("RGB")
+
+    user_prompt = build_user_prompt(
+        str(row["question"]),
+        str(row["a"]),
+        str(row["b"]),
+        str(row["c"]),
+        str(row["d"])
+    )
+
+    prompt_messages = [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_INSTRUCT}]},
+        {"role": "user", "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": user_prompt}
+        ]}
+    ]
+
+    prompt_text = processor.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+    prompt_inputs = processor(text=[prompt_text], images=[image], return_tensors="pt").to(device)
+    prompt_len = prompt_inputs["input_ids"].shape[1]
+
+    losses = {}
+
+    with torch.no_grad():
+        for letter, cand_text in candidates.items():
+            full_messages = prompt_messages + [
+                {"role": "assistant", "content": [{"type": "text", "text": str(cand_text)}]}
+            ]
+            full_text = processor.apply_chat_template(full_messages, tokenize=False, add_generation_prompt=False)
+            full_inputs = processor(text=[full_text], images=[image], return_tensors="pt").to(device)
+
+            labels = full_inputs["input_ids"].clone()
+            labels[:, :prompt_len] = -100
+            labels[full_inputs["attention_mask"] == 0] = -100
+
+            outputs = model(
+                input_ids=full_inputs["input_ids"],
+                attention_mask=full_inputs["attention_mask"],
+                pixel_values=full_inputs["pixel_values"],
+                labels=labels
+            )
+            losses[letter] = outputs.loss.item()
+
+    best_letter = min(losses, key=losses.get)
+    return best_letter
+# 14. 테스트셋 추론 및 제출 파일 생성
+model.eval()
+
+pred_letters = []
+raw_pred_texts = []
+fallback_count = 0
+
+for idx in tqdm(range(len(test_df)), total=len(test_df), desc="Inference"):
+    row = test_df.iloc[idx]
+
+    options = {
+        "a": str(row["a"]),
+        "b": str(row["b"]),
+        "c": str(row["c"]),
+        "d": str(row["d"]),
+    }
+
+    pred_text = generate_answer_text(row)
+    pred_letter = map_generated_text_to_letter(pred_text, options)
+
+    if pred_letter is None:
+        pred_letter = score_candidate_answers(row, options)
+        fallback_count += 1
+
+    pred_letters.append(pred_letter)
+    raw_pred_texts.append(pred_text)
+
+print("fallback_count:", fallback_count)
+submission = sample_sub.copy()
+submission["answer"] = pred_letters
+
+submission_path = OUTPUT_DIR / "sample_submission.csv"
+submission.to_csv(submission_path, index=False, encoding="utf-8-sig")
+
+debug_path = OUTPUT_DIR / "test_predictions_debug.csv"
+debug_df = test_df.copy()
+debug_df["generated_text"] = raw_pred_texts
+debug_df["pred_letter"] = pred_letters
+debug_df.to_csv(debug_path, index=False, encoding="utf-8-sig")
+
+print("saved:", submission_path)
+print("saved:", debug_path)
+display(submission.head())
+# 15. 제출 전 점검
+
+- `submission['answer']` 값이 모두 `a/b/c/d` 인지 확인
+- 필요하면 `debug_df`에서 생성 텍스트와 최종 알파벳 매핑 결과를 함께 점검
+assert submission["answer"].isin(["a", "b", "c", "d"]).all(), "제출 파일에 잘못된 값이 있습니다."
+print("submission format check passed.")
+submission["answer"].value_counts()
+# 16. 참고 메모
+
+실전 제출 전에 권장하는 순서:
+
+1. `QUICK_MODE = True`로 500개만 먼저 학습하여 경로/코드 이상 여부 확인  
+2. 문제가 없으면 `QUICK_MODE = False`로 전체 학습  
+3. `sample_submission.csv` 생성 후 제출
+
+필요 시 추가로 조정할 만한 항목:
+
+- `EPOCHS = 2`
+- `LR = 1e-5 ~ 2e-5`
+- `GRAD_ACCUM_STEPS` 증가
+- `IMAGE_SIZE = 448` 유지 또는 512로 확대
